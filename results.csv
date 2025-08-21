@@ -1,0 +1,17 @@
+prompt,cot_length,total_length,answer
+"Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\theta),$ where $r > 0$ and $0 \le \theta < 2 \pi.$",2366,2599,"To convert the rectangular coordinate \((0, 3)\) to polar coordinates, we follow these steps:
+
+1. **Identify the given point in Cartesian coordinates**: The point is \((0, 3)\).
+
+2. **Calculate the radius \(r\)**:
+   \[
+   r = \sqrt{x^2 + y^2} = \sqrt{0^2 + 3^2} = \sqrt{9} = 3
+   \]
+
+3. **Determine the angle \(\theta\)**:
+   - Since the point \((0, 3)\) is on the positive y-axis, the angle \(\theta\) is \(90^\circ\) or \(\frac{\pi}{2}\) radians.
+
+4. **Express the polar coordinates**:
+   - The polar coordinates are \((r, \theta)\), which is \((3, 90^\circ)\) or \((3, \frac{\pi}{2})\).
+
+Thus, the polar coordinates are \(\boxed{\left(3, \dfrac{\pi}{2}\right)}\)."

@@ -24,7 +24,7 @@ def detect_final_answer_repetition(sentences, keyword="Final Answer", threshold=
     return count >= threshold
 # ---------------- Hyper‑parameters ---------------- #
 # MODEL  = "/data01/huggingface_model_weights/r1-qwen-32b/"
-MODEL = "DeepSeek-R1-Distill-Llama-8B/"
+MODEL = "../DeepSeek-R1-Distill-Llama-8B/"
 DEVICE = torch.device("cuda")
 FRONT  = 4       # tokens kept at the very beginning
 TAIL   = 256     # rolling window on GPU
