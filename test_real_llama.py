@@ -64,8 +64,11 @@ class LayerKV:
 class KVManager:
     """Maintain FRONT+TAIL on GPU and MID on CPU, per model (draft/target)."""
 
+# In class KVManager:
+
     def __init__(self,
                  past_kv: List[Tuple[torch.Tensor, torch.Tensor]],
+                 attention_mask: torch.Tensor, # ◀◀◀ [수정] attention_mask를 직접 받음
                  front_len: int,
                  tail_cap: int,
                  device: torch.device,
@@ -75,11 +78,17 @@ class KVManager:
         self.tail_cap = tail_cap
         self.offload_buffer = offload_buffer
         self.layers: List[LayerKV] = []
+        
+        self.attention_masks: List[torch.Tensor] = []
 
         if not past_kv:
             return
 
         B = past_kv[0][0].size(0)
+        
+        for b in range(B):
+            self.attention_masks.append(attention_mask[b].to(self.device))
+
         cur_len = past_kv[0][0].size(-2)
         remaining = max(0, cur_len - front_len)
         tail_len = min(tail_cap, remaining)
@@ -107,6 +116,21 @@ class KVManager:
                     )
                 )
             self.layers.append(LayerKV(layer_seqs))
+
+    def filter_batch(self, indices_to_keep: List[int]):
+        """
+        Keeps only the sequences specified by indices_to_keep,
+        discarding all others. The indices are relative to the current state.
+        """
+        # attention_masks와 각 레이어의 seqs 리스트를 필터링합니다.
+        self.attention_masks = [self.attention_masks[i] for i in indices_to_keep]
+        for layer in self.layers:
+            layer.seqs = [layer.seqs[i] for i in indices_to_keep]
+
+    def update_attention_mask(self, seq_idx: int, num_committed: int):
+        if num_committed > 0:
+            new_mask_part = torch.ones(num_committed, device=self.device, dtype=torch.long)
+            self.attention_masks[seq_idx] = torch.cat([self.attention_masks[seq_idx], new_mask_part])
 
     def force_full(self, seq_indices: List[int]):
         if not seq_indices:
@@ -193,16 +217,19 @@ class KVManager:
             K_layers.append(K_batched)
             V_layers.append(V_batched)
             if li == 0: global_T_max = T_max
-
+            
         past.key_cache = K_layers
         past.value_cache = V_layers
 
+        # 2. 저장해 둔 attention_mask를 기반으로 올바른 마스크를 만듭니다.
         B_sub = len(seq_indices)
-        attn_mask = torch.zeros((B_sub, global_T_max + new_len), device=self.device, dtype=torch.long)
-        for i, L in enumerate(gpu_lengths):
-            attn_mask[i, global_T_max - L:global_T_max] = 1
-            attn_mask[i, global_T_max:] = 1
+        new_mask_part = torch.ones((B_sub, new_len), device=self.device, dtype=torch.long)
 
+        past_masks = [self.attention_masks[i][:global_T_max] for i in seq_indices]
+        
+        padded_past_masks = torch.nn.utils.rnn.pad_sequence(past_masks, batch_first=True, padding_value=0)
+
+        attn_mask = torch.cat([padded_past_masks, new_mask_part], dim=1)
         base = torch.tensor(lengths, device=self.device).unsqueeze(1)
         step = torch.arange(new_len, device=self.device).unsqueeze(0)
         position_ids = base + step
@@ -253,9 +280,9 @@ class SpecDecOptionA:
         self.draft = AutoModelForCausalLM.from_pretrained(draft_model_path, torch_dtype=torch.float16).to(device).eval()
         self.target = AutoModelForCausalLM.from_pretrained(target_model_path, torch_dtype=torch.float16).to(device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(draft_model_path, use_fast=False)
-        tok_n = len(self.tokenizer)
-        self.draft.resize_token_embeddings(tok_n)
-        self.target.resize_token_embeddings(tok_n)
+        # tok_n = len(self.tokenizer)
+        # self.draft.resize_token_embeddings(tok_n)
+        # self.target.resize_token_embeddings(tok_n)
         self.EOS = self.tokenizer.eos_token_id
         self.THINK_IDS = self.tokenizer.encode(think_token, add_special_tokens=False)
         self.buffers = [""] * batch_size
@@ -301,16 +328,19 @@ class SpecDecOptionA:
         V = target_logp.size(-1)
         idx = reject_pos.view(B, 1, 1).expand(B, 1, V)
         if greedy:
-            probs = target_logp.gather(1, idx + 1).squeeze(1).exp()
+            # ◀◀◀ [수정] 여기서 +1을 제거합니다.
+            probs = target_logp.gather(1, idx).squeeze(1).exp()
             return torch.argmax(probs, dim=-1, keepdim=True)
-        p = target_logp.gather(1, idx + 1).squeeze(1)
+        
+        # ◀◀◀ [수정] 여기서도 +1을 제거합니다.
+        p = target_logp.gather(1, idx).squeeze(1)
         q = draft_logp.gather(1, idx).squeeze(1)
         mask = p > q
         out = torch.full_like(p, float('-inf'))
         out[mask] = p[mask] + torch.log1p((-(q[mask] - p[mask]).exp()))
         dist = torch.softmax(out, dim=-1)
         return torch.multinomial(dist, num_samples=1)
-
+    
     def draft_propose_gamma(self, km: KVManager, seq_indices: List[int], prev_tokens: torch.Tensor):
         Bsub = prev_tokens.size(0)
         base_lens = km.seq_lengths(seq_indices)
@@ -353,13 +383,19 @@ class SpecDecOptionA:
         Bsub, n = draft_tokens.size(0), draft_tokens.size(1)
         base_lens = km.seq_lengths(seq_indices)
         inputs = torch.cat([prev_tokens.to(self.device), draft_tokens.to(self.device)], dim=1)
+        
         past, attn_mask, pos_ids = km.build_past_and_masks(seq_indices=seq_indices, new_len=inputs.size(1))
+
+        past_seq_len = past.key_cache[0].size(-2) if past.key_cache else 0
+
         out = self.target(input_ids=inputs, past_key_values=past,
                           attention_mask=attn_mask, position_ids=pos_ids, use_cache=True)
+                          
         logits_f = out.logits[:, -(n+1):, :].float()
         target_logp = torch.log_softmax(logits_f, dim=-1)
         kv_cache = out.past_key_values
-        return target_logp, kv_cache, base_lens
+        
+        return target_logp, kv_cache, base_lens, past_seq_len
 
     @torch.inference_mode()
     def run(self, prompts: List[str], max_new_tokens: int = 512, writer: Optional[csv.DictWriter] = None, f_handle: Optional = None):
@@ -371,9 +407,9 @@ class SpecDecOptionA:
         out_d = self.draft(input_ids=input_ids, attention_mask=attn, use_cache=True)
         out_t = self.target(input_ids=input_ids, attention_mask=attn, use_cache=True)
 
-        km_d = KVManager(out_d.past_key_values, self.front, self.tail, self.device, self.offload_buffer)
-        km_t = KVManager(out_t.past_key_values, self.front, self.tail, self.device, self.offload_buffer)
-
+        km_d = KVManager(out_d.past_key_values, attn, self.front, self.tail, self.device, self.offload_buffer)
+        km_t = KVManager(out_t.past_key_values, attn, self.front, self.tail, self.device, self.offload_buffer)
+        
         prev = input_ids[:, -1:]
         phase, finished, total_gen, cot_len = ["cot"] * B, [False] * B, [0] * B, [None] * B
         answer_texts = [""] * B  
@@ -392,18 +428,21 @@ class SpecDecOptionA:
             prev_all = prev[idx_active, :]
             q_logp_all, q_tokens_all, q_kvcache_all, base_lens_d = self.draft_propose_gamma(km_d, idx_active, prev_all)
             greedy = (self.temperature == 0)
-            n_gamma = q_tokens_all.size(1)
+            n_gamma = q_tokens_all.size(1) # q_tokens = [batch, gamma]
 
             if idx_cot:
                 cot_rows = [row for row, sidx in enumerate(idx_active) if sidx in idx_cot]
                 prev_cot = prev[idx_cot, :]
                 q_tokens_cot = q_tokens_all[cot_rows, :]
                 q_logp_cot = q_logp_all[cot_rows, :]
-                p_logp_cot, t_kvcache, base_lens_t = self.target_verify(km_t, idx_cot, prev_cot, q_tokens_cot)
+
+                p_logp_cot, t_kvcache, base_lens_t, past_seq_len_t = self.target_verify(km_t, idx_cot, prev_cot, q_tokens_cot)
+                
                 num_acc = self.evaluate_accept(q_tokens_cot, p_logp_cot, q_logp_cot, greedy)
                 cotrow_to_cotj = {row: j for j, row in enumerate(cot_rows)}
             else:
                 t_kvcache, num_acc, cotrow_to_cotj = None, None, {}
+
 
             for row, seq_idx in enumerate(idx_active):
                 if finished[seq_idx]: continue
@@ -417,6 +456,7 @@ class SpecDecOptionA:
                 eos_pos = toks.index(self.EOS) + 1 if self.EOS in toks else n_gamma
                 upper = min(remain, eos_pos, n_gamma)
 
+                print(num_acc)
                 if is_cot:
                     j = cotrow_to_cotj[row]
                     k_acc = int(num_acc[j, 0].item())
@@ -427,6 +467,7 @@ class SpecDecOptionA:
                                                     p_logp_cot[j:j+1, ...],
                                                     q_logp_all[row:row+1, ...],
                                                     greedy)
+                        print("resampled:", self.tokenizer.decode([r_tok.item()], skip_special_tokens=True, clean_up_tokenization_spaces=False))
                         committed_plus = committed + [r_tok.item()]
                         num_to_commit = k_acc + 1
                         prev_val = r_tok.item()
@@ -450,10 +491,18 @@ class SpecDecOptionA:
                 if num_to_commit > 0:
                     for li, (k, v) in enumerate(slice_from_kvcache(q_kvcache_all, row, base_lens_d[row], base_lens_d[row] + num_to_commit)):
                         km_d.append_tail_only(seq_idx, li, k, v)
+                    
                     if is_cot and t_kvcache:
                         j = cotrow_to_cotj[row]
-                        for li, (k, v) in enumerate(slice_from_kvcache(t_kvcache, j, base_lens_t[j], base_lens_t[j] + num_to_commit)):
+                        start_idx = past_seq_len_t
+                        for li, (k, v) in enumerate(slice_from_kvcache(t_kvcache, j, start_idx, start_idx + num_to_commit)):
                             km_t.append_tail_only(seq_idx, li, k, v)
+
+                    # ◀◀◀ [추가] KV 캐시를 업데이트한 후, attention_mask도 동일하게 업데이트합니다.
+                    km_d.update_attention_mask(seq_idx, num_to_commit)
+                    if is_cot:
+                        km_t.update_attention_mask(seq_idx, num_to_commit)
+                    
                     km_d.enforce_cap_for_seq(seq_idx)
                     if is_cot: km_t.enforce_cap_for_seq(seq_idx)
 

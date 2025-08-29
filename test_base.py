@@ -24,10 +24,10 @@ def detect_final_answer_repetition(sentences, keyword="Final Answer", threshold=
     return count >= threshold
 # ---------------- Hyper‑parameters ---------------- #
 # MODEL  = "/data01/huggingface_model_weights/r1-qwen-32b/"
-MODEL = "../DeepSeek-R1-Distill-Llama-8B/"
+MODEL = "../DeepSeek-R1-Distill-Qwen-7B/"
 DEVICE = torch.device("cuda")
 FRONT  = 4       # tokens kept at the very beginning
-TAIL   = 256     # rolling window on GPU
+TAIL   = 10000     # rolling window on GPU
 STEP   = 16      # how often to off‑load
 NUM    = 300
 RESULT_CSV = "test.csv"
@@ -228,7 +228,8 @@ def run(prompt: str, prune: bool, tag: str, full: bool, ans_full: bool, early_st
         logits[torch.isnan(logits) | torch.isinf(logits)] = -1e9
         probs  = torch.softmax(logits, dim=-1)
         next_tok = torch.argmax(probs, dim=-1, keepdim=True)   # sampling (greedy)
-
+        # next_tok = torch.multinomial(probs, num_samples=1)
+        
         tok_id = next_tok.item()
         recent_tokens.append(tok_id)
             
@@ -348,7 +349,7 @@ CSV_HEADER = [
     "cot_len_PR_ANS_EARLY", "total_PR_ANS_EARLY", "ratio_PR_ANS_EARLY"
 ]
 
-ds = load_dataset("HuggingFaceH4/MATH-500", "default", split=f"test[:{300}]")
+ds = load_dataset("HuggingFaceH4/MATH-500", "default", split=f"test[{1}:{300}]")
 
 with open(RESULT_CSV, "a", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
